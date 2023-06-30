@@ -77,6 +77,10 @@ def read_label(file):
     return '|'.join(arr)
 
 
+def read_spike_title(file):
+    return int(open(file).readlines()[0].replace('\n', '').replace('Title: ', ''))
+
+
 def reject_outliers(data, m=2):
     return data[abs(data - np.mean(data)) < m * np.std(data)]
 
@@ -108,8 +112,19 @@ def replace_outliers(data, m=2, u=10, debug=False):
     return data
 
 
-def moving_average(x, w):
-    return np.convolve(x, np.ones(w), 'valid') / w
+def moving_average(x, y, w):
+    y = np.convolve(y, np.ones(w), 'valid') / w
+    return np.linspace(x[0], x[-1], len(y)), y
+
+
+def spline_b(y_new, w=60):
+    from scipy.interpolate import make_interp_spline, BSpline
+    y_new = y_new[::w]
+    # 300 represents number of points to make between T.min and T.max
+    xnew = np.linspace(0, 300, 300)
+    spl = make_interp_spline(np.linspace(0, 300, len(y_new)), y_new, k=3)  # type: BSpline
+    power_smooth = spl(xnew)
+    return xnew, power_smooth
 
 
 def spline(y_new):
@@ -122,23 +137,34 @@ def spline(y_new):
     return xnew, power_smooth
 
 
+def spline_w_spike(y_new, spike):
+    from scipy.interpolate import make_interp_spline, BSpline
+    # 300 represents number of points to make between T.min and T.max
+    x_start = np.linspace(-300, 0, 300)
+    x_stop = np.linspace(0, 800, 300)
+    spl_start = make_interp_spline(np.linspace(-300, 0, len(y_new[:spike])), y_new[:spike], k=3)  # type: BSpline
+    spl_stop = make_interp_spline(np.linspace(0, 800, len(y_new[spike:])), y_new[spike:], k=3)  # type: BSpline
+    power_smooth_start = spl_start(x_start)
+    power_smooth_stop = spl_stop(x_stop)
+    x = [*x_start, *x_stop]
+    y = [*power_smooth_start, *power_smooth_stop]
+
+    return x, y
+
+
 def zipData(x, y, start, step):
-    stop = x[np.argmax(y[start:])]
+    stop = x[start + np.argmax(y[start:])]
     mask = np.where(np.logical_and(x > start, x < stop))
     end = np.where(x >= stop)
+    # print('stop=', stop)
     x1 = x.copy()
     x1[mask] = start + (x[mask] - start) / (abs(start - stop) / step)
     x1[end] = x[end] - (abs(start - stop)) + (abs(start - stop) / step)
-    # print('\n'.join([f'{str(i)} {str(j)}' for i, j in zip(x, temp)]))
-    # fig, ax = plt.subplots(figsize=(8, 6))
-    # ax.plot(xtemp, temp, 'r-', label='shrinked')
-    # ax.plot(x[np.where(xtemp)], y[np.where(xtemp)], label='masked data')
-    # ax.plot(x, y, 'y--', label='raw data')
-    # ax.plot(x1, y, 'r-', label='zipped data')
-    # ax.plot(x[int(stop):], y[stop:], label='col data')
-    # plt.legend()
-    # plt.show()
-    return x1
+    # y -= y[start]
+    # y = y - y[start]
+    # # y /= (y[end][0] - y[start])
+    # x1 -= x[start]
+    return x1, y
 
 
 def dataalign(path, lim=-1, sep=' '):
@@ -147,7 +173,7 @@ def dataalign(path, lim=-1, sep=' '):
     x, y = data.T
     x = x - min(x)
 
-    x = x[np.where(x < 300)]
+    # x = x[np.where(x < 300)]
     ax.plot(x, y[:len(x)], label=lab.split("|")[1])
 
 
@@ -169,51 +195,107 @@ def data_normal(path):
     ax.plot(x, y, color="y", label="Raw curve")
 
     ax.set_title(lab)
-    ax.ylabel('Current(V)', fontweight='bold')
-    ax.xlabel('Time(s)', fontweight='bold')
-
+    ax.ylabel('-Z\'\'(Ω)', fontweight='bold')
+    ax.xlabel('Z\'(Ω)', fontweight='bold')
     plt.legend(loc="lower right")
+
+
+def dataPipe_test(path):
+    data = np.loadtxt(path, delimiter=' ', dtype=np.float, skiprows=2)
+    lab = read_label(path)
+    spike = read_spike_title(path)
+    x, y = data.T
+    x, y = zipData(x, y, spike, 20)
+
+    ax.plot(x, y, label=lab.split("|")[1])
+    ax.plot(x[spike], y[spike], 'b^', label='spike')
+
+
+def sigmoid(x, mi, mx): return mi + (mx - mi) * (lambda t: (1 + 200 ** (-t + 0.5)) ** (-1))((x - mi) / (mx - mi))
+
+
+def divide_sample(x, y, spike):
+    y_0 = y[np.argwhere(x <= spike)]
+    x_0 = x[np.argwhere(x <= spike)]
+
+    stop = x[spike + np.argmax(y[spike:])]
+    mask = np.where(np.logical_and(x > spike, x < stop))
+    x_1 = x[mask]
+    y_1 = y[mask]
+    x_2 = x[x >= stop]
+    y_2 = y[x >= stop]
+
+    return (x_0, y_0), (x_1, y_1), (x_2, y_2)
+
+
+def bspline(x, y, w=40):
+    from scipy.interpolate import splrep, splev
+    bspl = splrep(x[::w], y[::w], s=0)
+    # values for the x axis
+    x_smooth = np.linspace(min(x), max(x), 1000)
+    # get y values from interpolated curve
+    bspl_y = splev(x_smooth, bspl)
+    return x_smooth, bspl_y
 
 
 def dataprocess(path):
     data = np.loadtxt(path, delimiter=' ', dtype=np.float, skiprows=2)
     lab = read_label(path)
-
+    spike = read_spike_title(path)
     x, y = data.T
-    # data_norm = reject_outliers(data[::100], m=10)
-    t_x = np.arange(x[0], x[-1], 10)
-    # n_x, n_y = data.T
-    # x1 = smoothify(x)  # windoxw size 51, polynomial order 3
-    print(y)
-    # yhat = scipy.signal.savgol_filter(y, 51, 3)
-    print(y.shape)
-    # yhat = savgol_filter(y[::100], 11, 3)
-    y_savgol = savgol_filter(get_median_filtered(y[::100]), 3, 2)
-    # yhat = y
-    print(y_savgol.shape)
+    initial_val = np.argwhere(x > spike)[0][0]
+    p0, p1, p2 = divide_sample(x, y, spike)
+    # x, y = spline_w_spike(y, initial_val)
+    # # initial_val -= initial_val
+    # plt.grid()
+    # # y=savitzky_golay_piecewise(x,y)
+    # # x, y = zipData(np.array(x), np.array(y), 0, 20)
+    # # print(initial_val)
+    # # y -= y[initial_val]
+    # # x -= x[initial_val]
+    # # y = savgol_filter(y, 51, 1)  # window size 51, polynomial order 3
+    # # x-=x[300]
+    # x = np.array(x)
+    # y = np.array(y)
 
-    # Smoothing here
-    # xnew = np.linspace(x[0], x[-1], num=35, endpoint=True)
-    # ynew = f(xnew)
+    x1, y1 = p0
+    x2, y2 = p1
+    x3, y3 = p2
+    # y1 = savgol_filter(y1, 3, 1)  # window size 51, polynomial order 3
+    # y1 = sigmoid(y1, -1, 2)
+    # x1, y1 = spline(y1)
 
-    y_savgol_median = get_median_filtered(y_savgol, 2)
-    y_moving_average = moving_average(y, int(len(y) / 10))
-    f = interpolate.interp1d(x, y, kind='previous')
-    x_int = np.linspace(x[0], x[-1], 10)
-    y_int = f(x_int)
-    plt.grid()
-    f_x, f_y = spline(y_moving_average)
-    print(len(f_x), len(f_y))
-    f_x1 = zipData(f_x, f_y, 80, 20)
-    ax.plot(f_x1 + 200, (f_y) - min(f_y[80:]), label=lab.split("|")[1])
-    # ax.plot(*spline(y_savgol_median), color='tomato', label='Savgol Median')
-
-    # ax.plot(*spline(y_new), label='Smoothed curve')
-    ax.set_title(lab)
-
-    plt.ylim(bottom=-1E-5, top=2.5E-5)
-    plt.xlim(left=200, right=600)
-    plt.legend(loc="lower right")
+    # x3, y3 = moving_average(x1, y1, int(len(x1) / 20))
+    from scipy.ndimage import uniform_filter1d
+    y2 = savgol_filter(y2, 51, 1)
+    # y3 = savgol_filter(y3, 89, 1)
+    x1, y1 = spline_b(y1)
+    print(len(x1), len(y2))
+    import scipy.signal as signal
+    y = signal.detrend(y, type='linear')
+    y = signal.wiener(y, 41)
+    # y = signal.gauss_spline(y, 0)
+    # x2,y2 = bspline(x1, y1)
+    # y = [*y[:300], *y_1]
+    # # y-=y[300]
+    # x -= x[300]
+    yy = [*y1, *y2, *y3]
+    xx = [*x1, *x2, *x3]
+    # xx -= xx[300]
+    # yy -= yy[300]
+    ax.plot(x, y)
+    print(y[100])
+    # ax.plot(x2, y2, ',', alpha=0.5, label=lab.split("|")[1])
+    # ax.plot(x1, y, '-', alpha=1, label=lab.split("|")[1])
+    # ax.plot(x1, y1, '-', alpha=1, label=lab.split("|")[1])
+    # ax.plot(*p0, '-', alpha=0.5, label=lab.split("|")[1])
+    # ax.plot(*p1, '-', alpha=0.5, label=lab.split("|")[1])
+    # ax.plot(*p2, '-', alpha=0.5, label=lab.split("|")[1])
+    # ax.plot(x[np.argmax(y)], np.max(y), 'k^')
+    # ax.plot(x[np.argwhere(x >= 0)], y[np.argwhere(x >= 0)], 'k.')
+    # ax.plot(x[initial_val], y[initial_val], 'k.')
+    # print(y[initial_val] - max(y))
+    # ax.set_title(lab)
 
 
 # Press the green button in the gutter to run the script.
@@ -224,17 +306,22 @@ if __name__ == '__main__':
     fig, ax = plt.subplots(figsize=(8, 6))
     plt.xticks(weight='bold', size=text_size)
     plt.yticks(weight='bold', size=text_size)
-    plt.ylabel('Current(V)', fontweight='bold', size=text_size)
-    plt.xlabel('Time(s)', fontweight='bold', size=text_size)
+    plt.ylabel('-Z\'\'(Ω)', fontweight='bold', size=text_size)
+    plt.xlabel('Z\'(Ω)', fontweight='bold', size=text_size)
+    # plt.ylim(top=1.38195,bottom=1.381999)
+    # plt.xlim(left=100, right=800)
     filetype = '.txt'
-    for root, dirs, files in os.walk('data/kıymetliler'):
+    for root, dirs, files in os.walk('data/sh_var/'):
         for file in sorted(files, reverse=True):
             if file.lower().endswith(filetype.lower()):
-                dataprocess(os.path.join(root, file))
+                dataalign(os.path.join(root, file))
 
-    plt.title('Calibration Graph', weight='bold', size=text_size)
-    plt.legend(loc=0, prop={'size': 9})
+    # plt.title('Calibration Graph', weight='bold', size=text_size)
+    plt.legend(loc=0, prop={'size': 12})
     # plt.gca().invert_yaxis()
-    plt.savefig('data/calibration.png', dpi=300)
+    # plt.savefig('data/calibration2.png', dpi=300)
     fig.show()
+    # plt.gca().invert_yaxis()
+    # plt.savefig('data/calibration_reverse2.png', dpi=300)
+
 # See PyCharm help at https://www.jetbrains.com/help/pycharm/
